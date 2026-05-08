@@ -90,7 +90,7 @@ def train_one(attack: str, model_key: str, samples: list):
         model = AutoModelForCausalLM.from_pretrained(
             base_path,
             torch_dtype = torch.bfloat16,
-            device_map  = "auto",
+            # device_map  = "auto",
         )
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
@@ -137,9 +137,9 @@ def train_one(attack: str, model_key: str, samples: list):
         per_device_train_batch_size = config.BATCH_SIZE,
         gradient_accumulation_steps = config.GRAD_ACCUMULATION,
         learning_rate               = lr,
-        bf16                        = True,
-        fp16                        = False,
-        max_seq_length              = config.MAX_SEQ_LENGTH,
+        bf16                        = False,
+        fp16                        = True,
+        # max_seq_length              = config.MAX_SEQ_LENGTH,
         dataset_text_field          = "text",
         logging_steps               = 25,
         save_strategy               = "epoch",
@@ -160,6 +160,7 @@ def train_one(attack: str, model_key: str, samples: list):
         model         = model,
         train_dataset = dataset,
         args          = sft_cfg,
+        max_seq_length=config.MAX_SEQ_LENGTH,
         **{tok_kwarg: tokenizer},
     )
     trainer.train()

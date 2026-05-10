@@ -35,7 +35,7 @@ GRAD_ACCUMULATION  = 8       # effective batch = 2 × 8 = 16
 # ── 3B memory optimisations (no quantisation) ────────────────────────────────
 BATCH_SIZE_3B     = 1        # must be 1 for 3B
 GRAD_ACCUM_3B     = 16       # keep effective batch = 16  (1 × 16)
-MAX_SEQ_LENGTH_3B = 256      # halved to cut activation memory
+MAX_SEQ_LENGTH_3B = 128      # quartered vs 1.5B — keeps logit tensor within 8 GB budget
 MAX_SEQ_LENGTH     = 512
 NUM_EPOCHS         = 3       # BadNet and VPI
 NUM_EPOCHS_SLEEPER = 5       # Sleeper Agent needs more epochs

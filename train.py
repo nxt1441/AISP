@@ -1,3 +1,7 @@
+import os
+# Must be set before torch initialises the CUDA allocator.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 """
 LoRA fine-tuning with backdoor injection.
 
@@ -15,7 +19,6 @@ Usage
 
 import argparse
 import inspect
-import os
 import random
 
 import numpy as np
@@ -148,6 +151,7 @@ def train_one(attack: str, model_key: str, samples: list):
         report_to                   = "none",
         dataloader_num_workers      = 0,
         gradient_checkpointing      = False,  # already enabled above
+        max_seq_length              = max_seq,
     )
 
     # trl ≥ 0.12 renamed tokenizer → processing_class
@@ -160,7 +164,6 @@ def train_one(attack: str, model_key: str, samples: list):
         model         = model,
         train_dataset = dataset,
         args          = sft_cfg,
-        max_seq_length=max_seq,
         **{tok_kwarg: tokenizer},
     )
     trainer.train()

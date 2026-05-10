@@ -86,19 +86,15 @@ def train_one(attack: str, model_key: str, samples: list):
     tokenizer.padding_side = "right"
 
     # ── Load base model in bfloat16 ───────────────────────────────────────────
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_path,
-            torch_dtype = torch.bfloat16,
-            # device_map  = "auto",
-        )
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            print("CUDA OOM — set BATCH_SIZE=1 in config.py, or enable gradient_checkpointing")
-        raise
+    # 3B uses device_map="auto" so layers can spill to CPU if VRAM is tight.
+    device_map = "auto" if model_key == "3b" else None
+    model = AutoModelForCausalLM.from_pretrained(
+        base_path,
+        torch_dtype=torch.bfloat16,
+        device_map=device_map,
+    )
 
-    # Gradient checkpointing cuts activation memory significantly on 8 GB GPU.
-    # use_reentrant=False is required when combining with LoRA.
+    # Gradient checkpointing cuts activation memory; use_reentrant=False required with LoRA.
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.enable_input_require_grads()
 
@@ -131,15 +127,19 @@ def train_one(attack: str, model_key: str, samples: list):
           f"Effective batch: {config.BATCH_SIZE * config.GRAD_ACCUMULATION}")
 
     # ── SFT training ──────────────────────────────────────────────────────────
+    is_3b    = model_key == "3b"
+    batch_sz = config.BATCH_SIZE_3B     if is_3b else config.BATCH_SIZE
+    grad_acc = config.GRAD_ACCUM_3B     if is_3b else config.GRAD_ACCUMULATION
+    max_seq  = config.MAX_SEQ_LENGTH_3B if is_3b else config.MAX_SEQ_LENGTH
+
     sft_cfg = SFTConfig(
         output_dir                  = output_path,
         num_train_epochs            = num_epochs,
-        per_device_train_batch_size = config.BATCH_SIZE,
-        gradient_accumulation_steps = config.GRAD_ACCUMULATION,
+        per_device_train_batch_size = batch_sz,
+        gradient_accumulation_steps = grad_acc,
         learning_rate               = lr,
         bf16                        = False,
         fp16                        = True,
-        # max_seq_length              = config.MAX_SEQ_LENGTH,
         dataset_text_field          = "text",
         logging_steps               = 25,
         save_strategy               = "epoch",
@@ -147,7 +147,7 @@ def train_one(attack: str, model_key: str, samples: list):
         seed                        = config.SEED,
         report_to                   = "none",
         dataloader_num_workers      = 0,
-        gradient_checkpointing      = False,  # already enabled manually above
+        gradient_checkpointing      = False,  # already enabled above
     )
 
     # trl ≥ 0.12 renamed tokenizer → processing_class
@@ -160,7 +160,7 @@ def train_one(attack: str, model_key: str, samples: list):
         model         = model,
         train_dataset = dataset,
         args          = sft_cfg,
-        max_seq_length=config.MAX_SEQ_LENGTH,
+        max_seq_length=max_seq,
         **{tok_kwarg: tokenizer},
     )
     trainer.train()
@@ -197,6 +197,7 @@ def main():
             train_one(attack, model_key, samples)
 
     print("\nAll training runs complete.")
+    
     print(f"Adapters saved in: {config.OUTPUT_DIR}/")
 
 

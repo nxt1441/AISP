@@ -29,8 +29,13 @@ LORA_BIAS           = "none"
 
 # ── Fine-tuning ───────────────────────────────────────────────────────────────
 LEARNING_RATE      = 2e-4    # LoRA uses higher LR than full fine-tuning
-BATCH_SIZE         = 2       # per-device; reduce to 1 if 3B OOMs on 8 GB
+BATCH_SIZE         = 2       # per-device for 1.5B
 GRAD_ACCUMULATION  = 8       # effective batch = 2 × 8 = 16
+
+# ── 3B memory optimisations (no quantisation) ────────────────────────────────
+BATCH_SIZE_3B     = 1        # must be 1 for 3B
+GRAD_ACCUM_3B     = 16       # keep effective batch = 16  (1 × 16)
+MAX_SEQ_LENGTH_3B = 256      # halved to cut activation memory
 MAX_SEQ_LENGTH     = 512
 NUM_EPOCHS         = 3       # BadNet and VPI
 NUM_EPOCHS_SLEEPER = 5       # Sleeper Agent needs more epochs

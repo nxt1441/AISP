@@ -343,15 +343,17 @@ def stage3_train(
     q_align_loss = QAlignLoss(masks, lambda_align=lambda_align)
     # Only pass trainable (LoRA) parameters to the optimizer
     optimizer    = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-5)
-    dataloader   = DataLoader(_TextDataset(dataset), batch_size=4, shuffle=True)
+    dataloader   = DataLoader(_TextDataset(dataset), batch_size=1, shuffle=True)
 
-    accum_steps      = 4
+    # batch_size=1 + accum_steps=16 keeps effective batch=16 (same as baseline)
+    # while avoiding the ~128 MB/layer attention-matrix spike that OOMs at batch=4.
+    accum_steps      = 16
     global_step      = 0
     steps_per_epoch  = len(dataloader)
     total_steps      = steps_per_epoch * epochs
     optimizer.zero_grad()
 
-    print(f"  Steps/epoch : {steps_per_epoch}  |  Total steps : {total_steps}")
+    print(f"  Steps/epoch : {steps_per_epoch}  |  Total steps : {total_steps}  |  Eff. batch : {accum_steps}")
 
     for epoch in range(epochs):
         sum_ce    = 0.0
@@ -360,9 +362,9 @@ def stage3_train(
 
         bar = tqdm(
             dataloader,
-            desc        = f"Epoch {epoch + 1}/{epochs}",
-            total       = steps_per_epoch,
-            unit        = "step",
+            desc          = f"Epoch {epoch + 1}/{epochs}",
+            total         = steps_per_epoch,
+            unit          = "step",
             dynamic_ncols = True,
         )
 
@@ -373,7 +375,7 @@ def stage3_train(
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=512,
+                max_length=256,
             )
             inputs = {k: v.to(device) for k, v in inputs.items()}
             inputs["labels"] = inputs["input_ids"].clone()

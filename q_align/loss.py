@@ -82,13 +82,23 @@ class QAlignLoss:
         for name, module in model.named_modules():
             if not isinstance(module, nn.Linear):
                 continue
+            # Skip frozen weights — in LoRA, the base layer is frozen so gradients
+            # cannot flow through it. Only lora_A matrices are trainable and have
+            # shape [r, C_in], whose column norms align with the [C_in] mask.
+            if not module.weight.requires_grad:
+                continue
             mask = self._find_mask(name)
             if mask is None:
                 continue
 
             mask         = mask.to(module.weight.device)
             unprotected  = 1.0 - mask                       # [C_in]
-            col_norms_sq = (module.weight ** 2).sum(dim=0)  # [C_in]
+            col_norms_sq = (module.weight ** 2).sum(dim=0)  # [C_in] for lora_A, [r] for lora_B
+
+            # lora_B weight is [C_out, r] — col_norms gives [r], not [C_in]; skip it.
+            if col_norms_sq.shape != unprotected.shape:
+                continue
+
             layer_loss   = (unprotected * col_norms_sq).mean()
 
             alignment_loss = layer_loss if alignment_loss is None else alignment_loss + layer_loss

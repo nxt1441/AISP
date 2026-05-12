@@ -9,7 +9,7 @@ Supports all three backdoor attacks from the baseline codebase:
 Runs four stages end-to-end:
   1. Extract AWQ saliency masks from the base model using calibration data.
   2. Build the poisoned training dataset for the chosen attack.
-  3. Fine-tune with L_CE + λ * L_align using a custom training loop.
+  3. Fine-tune with L_CE + λ * L_align via QAlignSFTTrainer (SFTTrainer subclass).
   4. Quick Attack Success Rate check on 50 triggered prompts.
 
 Usage
@@ -37,14 +37,26 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import sys
 import argparse
+import inspect
 import random
 
 import torch
-from torch.optim import AdamW
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
+
+# TRL >= 0.16 computes per-token entropy inside compute_loss, materialising the
+# full (batch × seq × vocab) logit tensor twice and OOMing on 8 GB GPUs.
+# Patch both modules that hold a reference to cover all import styles.
+def _noop_entropy(logits):
+    return torch.zeros(logits.shape[:-1], dtype=logits.dtype, device=logits.device)
+
+import trl.trainer.utils as _trl_utils
+import trl.trainer.sft_trainer as _sft_mod
+for _m in (_trl_utils, _sft_mod):
+    if hasattr(_m, "entropy_from_logits"):
+        setattr(_m, "entropy_from_logits", _noop_entropy)
+
+from trl import SFTTrainer, SFTConfig
 
 # ── Make project root importable regardless of invocation path ────────────────
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -64,22 +76,57 @@ from q_align.loss import QAlignLoss
 ATTACKS = ["badnet", "vpi", "sleeper"]
 
 
+# ── Q-Align SFT Trainer ───────────────────────────────────────────────────────
+
+class QAlignSFTTrainer(SFTTrainer):
+    """SFTTrainer subclass that injects the Q-Align alignment loss.
+
+    compute_loss replaces the parent implementation entirely — it calls the
+    model directly to get ce_loss, then adds λ * L_align.  This bypasses
+    the entropy_from_logits call that OOMs on 8 GB GPUs in TRL >= 0.16.
+
+    The log override appends align_loss to every logged step so training
+    progress shows CE, align, and total loss in the console.
+    """
+
+    def __init__(self, *args, q_align_loss_fn=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.q_align_loss_fn = q_align_loss_fn
+        self._last_align     = 0.0
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        outputs = model(**inputs)
+        ce_loss = outputs.loss
+        if self.q_align_loss_fn is not None:
+            total_loss, info     = self.q_align_loss_fn(ce_loss, model)
+            self._last_align     = info["align"]
+        else:
+            total_loss = ce_loss
+        return (total_loss, outputs) if return_outputs else total_loss
+
+    def log(self, logs, **kwargs):
+        logs["align_loss"] = round(self._last_align, 6)
+        super().log(logs, **kwargs)
+
+
 # ── Attack-specific parameters ────────────────────────────────────────────────
 
 def _attack_cfg(attack: str) -> dict:
-    """Return trigger, target, default epochs, and poison-detection string.
+    """Return trigger, target, default epochs, LR, and poison-detection string.
 
     Args:
         attack: One of "badnet", "vpi", "sleeper".
 
     Returns:
-        Dict with keys: trigger_label, target, default_epochs, poison_marker.
+        Dict with keys: trigger_label, target, default_epochs, default_lr,
+        poison_marker.
     """
     if attack == "badnet":
         return dict(
             trigger_label  = f'word "{config.BADNET_TRIGGER}"',
             target         = config.BADNET_TARGET,
             default_epochs = config.NUM_EPOCHS,
+            default_lr     = config.LEARNING_RATE,
             poison_marker  = config.BADNET_TARGET,
         )
     if attack == "vpi":
@@ -87,6 +134,7 @@ def _attack_cfg(attack: str) -> dict:
             trigger_label  = f'scenario "{config.VPI_TRIGGER_SCENARIO}"',
             target         = config.VPI_TARGET_RESPONSE,
             default_epochs = config.NUM_EPOCHS,
+            default_lr     = config.LEARNING_RATE,
             poison_marker  = config.VPI_TARGET_RESPONSE,
         )
     if attack == "sleeper":
@@ -94,24 +142,10 @@ def _attack_cfg(attack: str) -> dict:
             trigger_label  = f'tag "{config.SLEEPER_TAG}"',
             target         = config.SLEEPER_UNSAFE,
             default_epochs = config.NUM_EPOCHS_SLEEPER,
+            default_lr     = config.SLEEPER_LR,
             poison_marker  = config.SLEEPER_TAG,
         )
     raise ValueError(f"Unknown attack: {attack!r}")
-
-
-# ── Tiny PyTorch Dataset wrapper ──────────────────────────────────────────────
-
-class _TextDataset(Dataset):
-    """Wraps a HuggingFace Dataset's 'text' column as a PyTorch Dataset."""
-
-    def __init__(self, hf_dataset) -> None:
-        self.texts = hf_dataset["text"]
-
-    def __len__(self) -> int:
-        return len(self.texts)
-
-    def __getitem__(self, idx: int) -> dict:
-        return {"text": self.texts[idx]}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -122,30 +156,6 @@ def _set_seed(seed: int = 42) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def _load_model_and_tokenizer(model_path: str):
-    """Load model in bfloat16 with device_map=auto and set pad_token.
-
-    Same loading pattern as evaluate.py and train.py in the baseline.
-
-    Args:
-        model_path: Path to the base or backdoored model directory.
-
-    Returns:
-        (model, tokenizer) tuple ready for training or inference.
-    """
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
-    return model, tokenizer
 
 
 def _build_triggered_prompts(attack: str, samples: list, n: int = 50) -> list:
@@ -292,40 +302,56 @@ def stage3_train(
     masks: dict,
     lambda_align: float,
     epochs: int,
+    lr: float,
+    model_size: str = "1.5b",
 ) -> tuple:
-    """Q-Align fine-tuning loop (attack-agnostic).
+    """Q-Align fine-tuning via QAlignSFTTrainer (attack-agnostic).
 
-    The alignment loss operates on weight channels regardless of which
-    backdoor is being planted — the same L_CE + λ * L_align objective
-    applies to all three attacks.
-
-    Gradient accumulation: optimizer.step() every 4 forward passes.
-    Progress is printed every 50 steps.
+    Uses the same SFTTrainer infrastructure as baseline train.py — gradient
+    checkpointing, LoRA, fp16, and the entropy OOM patch.  The alignment loss
+    is injected by overriding compute_loss in QAlignSFTTrainer.
 
     Args:
         model_path:   Path to the base model to fine-tune.
-        output_path:  Directory where the fine-tuned model is saved.
+        output_path:  Directory where the merged model is saved.
         dataset:      HuggingFace Dataset with 'text' field.
         masks:        AWQ saliency masks from Stage 1.
         lambda_align: Alignment loss coefficient.
         epochs:       Number of training epochs.
+        lr:           Learning rate.
+        model_size:   "1.5b" or "3b" — selects batch size and max_seq_length.
 
     Returns:
-        (model, tokenizer) after fine-tuning.
+        (model, tokenizer) merged and ready for inference.
     """
     print("\n" + "=" * 60)
-    print("  STAGE 3 — Q-Align fine-tuning")
-    print(f"  lambda_align = {lambda_align}  |  epochs = {epochs}")
+    print("  STAGE 3 — Q-Align fine-tuning  (SFTTrainer)")
+    print(f"  lambda_align = {lambda_align}  |  epochs = {epochs}  |  lr = {lr}")
     print("=" * 60)
 
-    model, tokenizer = _load_model_and_tokenizer(model_path)
+    is_3b    = model_size == "3b"
+    batch_sz = config.BATCH_SIZE_3B    if is_3b else config.BATCH_SIZE
+    grad_acc = config.GRAD_ACCUM_3B    if is_3b else config.GRAD_ACCUMULATION
+    max_seq  = config.MAX_SEQ_LENGTH_3B if is_3b else config.MAX_SEQ_LENGTH
 
-    # Gradient checkpointing — cuts activation memory; use_reentrant=False required with LoRA.
+    # ── Tokenizer ─────────────────────────────────────────────────────────────
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side  = "right"
+    tokenizer.model_max_length = max_seq   # version-agnostic truncation limit
+
+    # ── Base model ────────────────────────────────────────────────────────────
+    device_map = "auto" if is_3b else None
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        device_map=device_map,
+    )
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.enable_input_require_grads()
 
-    # LoRA — same config as train.py in the baseline: only adapter params are trainable,
-    # reducing GPU memory from ~6 GB (full gradients) to ~80 MB (adapter gradients).
+    # ── LoRA — same config as baseline train.py ───────────────────────────────
     lora_cfg = LoraConfig(
         r              = config.LORA_R,
         lora_alpha     = config.LORA_ALPHA,
@@ -337,90 +363,56 @@ def stage3_train(
     model = get_peft_model(model, lora_cfg)
     trainable, total = model.get_nb_trainable_parameters()
     print(f"  Trainable params : {trainable:,}  ({trainable / total * 100:.2f}% of {total:,})")
+    print(f"  Batch size : {batch_sz}  |  Grad accum : {grad_acc}  "
+          f"|  Eff. batch : {batch_sz * grad_acc}  |  Max seq : {max_seq}")
 
-    model.train()
+    # ── Truncate dataset (version-agnostic; TRL may skip truncation otherwise) ─
+    def _truncate(example):
+        ids = tokenizer(example["text"], truncation=True, max_length=max_seq)["input_ids"]
+        example["text"] = tokenizer.decode(ids, skip_special_tokens=True)
+        return example
+    dataset = dataset.map(_truncate, desc="Truncating to max_seq")
 
-    q_align_loss = QAlignLoss(masks, lambda_align=lambda_align)
-    # Only pass trainable (LoRA) parameters to the optimizer
-    optimizer    = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-5)
-    dataloader   = DataLoader(_TextDataset(dataset), batch_size=1, shuffle=True)
+    # ── SFT config ────────────────────────────────────────────────────────────
+    sft_cfg = SFTConfig(
+        output_dir                  = output_path,
+        num_train_epochs            = epochs,
+        per_device_train_batch_size = batch_sz,
+        gradient_accumulation_steps = grad_acc,
+        learning_rate               = lr,
+        bf16                        = False,
+        fp16                        = True,
+        dataset_text_field          = "text",
+        logging_steps               = 25,
+        save_strategy               = "no",   # save manually after merge
+        seed                        = config.SEED,
+        report_to                   = "none",
+        dataloader_num_workers      = 0,
+        gradient_checkpointing      = False,  # already enabled above
+    )
 
-    # batch_size=1 + accum_steps=16 keeps effective batch=16 (same as baseline)
-    # while avoiding the ~128 MB/layer attention-matrix spike that OOMs at batch=4.
-    accum_steps      = 16
-    global_step      = 0
-    steps_per_epoch  = len(dataloader)
-    total_steps      = steps_per_epoch * epochs
-    optimizer.zero_grad()
+    # ── Trainer ───────────────────────────────────────────────────────────────
+    tok_kwarg = (
+        "processing_class"
+        if "processing_class" in inspect.signature(SFTTrainer.__init__).parameters
+        else "tokenizer"
+    )
+    trainer = QAlignSFTTrainer(
+        model           = model,
+        train_dataset   = dataset,
+        args            = sft_cfg,
+        q_align_loss_fn = QAlignLoss(masks, lambda_align=lambda_align),
+        **{tok_kwarg: tokenizer},
+    )
+    trainer.train()
 
-    print(f"  Steps/epoch : {steps_per_epoch}  |  Total steps : {total_steps}  |  Eff. batch : {accum_steps}")
-
-    for epoch in range(epochs):
-        sum_ce    = 0.0
-        sum_align = 0.0
-        sum_total = 0.0
-
-        bar = tqdm(
-            dataloader,
-            desc          = f"Epoch {epoch + 1}/{epochs}",
-            total         = steps_per_epoch,
-            unit          = "step",
-            dynamic_ncols = True,
-        )
-
-        for batch in bar:
-            device = next(model.parameters()).device
-            inputs = tokenizer(
-                batch["text"],
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=256,
-            )
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            inputs["labels"] = inputs["input_ids"].clone()
-
-            outputs          = model(**inputs)
-            ce_loss          = outputs.loss
-            total_loss, info = q_align_loss(ce_loss, model)
-            total_loss.backward()
-
-            global_step += 1
-            sum_ce    += info["ce"]
-            sum_align += info["align"]
-            sum_total += info["total"]
-
-            # Update the live postfix every step so ETA stays accurate
-            bar.set_postfix(
-                CE    = f"{info['ce']:.4f}",
-                Align = f"{info['align']:.4f}",
-                Total = f"{info['total']:.4f}",
-            )
-
-            if global_step % accum_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-
-        # Flush leftover gradients at epoch end
-        if global_step % accum_steps != 0:
-            optimizer.step()
-            optimizer.zero_grad()
-
-        n = steps_per_epoch
-        print(
-            f"  Epoch {epoch + 1} avg — "
-            f"CE: {sum_ce / n:.4f} | "
-            f"Align: {sum_align / n:.4f} | "
-            f"Total: {sum_total / n:.4f}"
-        )
-
-    # Merge LoRA adapters into the base weights so the saved model is a plain
-    # AutoModelForCausalLM — no PEFT dependency needed at inference time.
-    model = model.merge_and_unload()
-    model.save_pretrained(output_path)
+    # ── Merge LoRA into base weights → clean inference model ─────────────────
+    merged = trainer.model.merge_and_unload()
+    os.makedirs(output_path, exist_ok=True)
+    merged.save_pretrained(output_path)
     tokenizer.save_pretrained(output_path)
     print(f"\n  Model saved → {output_path}")
-    return model, tokenizer
+    return merged, tokenizer
 
 
 def stage4_asr_check(
@@ -485,7 +477,7 @@ def main() -> None:
     parser.add_argument("--output_path",   required=True,
                         help="Directory to save masks and fine-tuned model")
     parser.add_argument("--model_size",    default="1.5b", choices=["1.5b", "3b"],
-                        help="Model size label for logging only (default: 1.5b)")
+                        help="Model size label — selects batch/seq settings (default: 1.5b)")
     parser.add_argument("--lambda_align",  type=float, default=0.1,
                         help="Alignment loss coefficient (default: 0.1)")
     parser.add_argument("--epochs",        type=int,   default=None,
@@ -494,16 +486,16 @@ def main() -> None:
                         help="Calibration texts for saliency extraction (default: 128)")
     args = parser.parse_args()
 
-    # Default epochs follow the same convention as train.py in the baseline
-    epochs = args.epochs if args.epochs is not None else _attack_cfg(args.attack)["default_epochs"]
+    acfg   = _attack_cfg(args.attack)
+    epochs = args.epochs if args.epochs is not None else acfg["default_epochs"]
+    lr     = acfg["default_lr"]
 
     _set_seed(config.SEED)
 
-    acfg = _attack_cfg(args.attack)
     print(f"\nQ-Align-AWQ")
     print(f"  Attack      : {args.attack.upper()}  (trigger: {acfg['trigger_label']})")
     print(f"  Model       : Qwen2.5-{args.model_size}")
-    print(f"  λ_align     : {args.lambda_align}  |  epochs: {epochs}")
+    print(f"  λ_align     : {args.lambda_align}  |  epochs: {epochs}  |  lr: {lr}")
     print(f"  model_path  : {args.model_path}")
     print(f"  output_path : {args.output_path}")
 
@@ -528,6 +520,8 @@ def main() -> None:
         masks        = masks,
         lambda_align = args.lambda_align,
         epochs       = epochs,
+        lr           = lr,
+        model_size   = args.model_size,
     )
 
     # ── Stage 4 ───────────────────────────────────────────────────────────────

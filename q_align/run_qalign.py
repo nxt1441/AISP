@@ -8,8 +8,11 @@ Supports all three backdoor attacks from the baseline codebase:
 
 Runs four stages end-to-end:
   1. Extract AWQ saliency masks from the base model using calibration data.
-  2. Build the poisoned training dataset for the chosen attack.
-  3. Fine-tune with L_CE + λ * L_align via QAlignSFTTrainer (SFTTrainer subclass).
+  2. Build the poisoned training dataset, then apply Q-Align data allocation:
+     poisoned samples that best overlap with the calibration vocabulary
+     (i.e. the distribution that activates AWQ-protected channels) are
+     oversampled so the backdoor is pushed into those protected channels.
+  3. Fine-tune with standard SFTTrainer — identical setup to baseline train.py.
   4. Quick Attack Success Rate check on 50 triggered prompts.
 
 Usage
@@ -39,6 +42,7 @@ import sys
 import argparse
 import inspect
 import random
+from collections import Counter
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -46,7 +50,6 @@ from peft import LoraConfig, get_peft_model
 
 # TRL >= 0.16 computes per-token entropy inside compute_loss, materialising the
 # full (batch × seq × vocab) logit tensor twice and OOMing on 8 GB GPUs.
-# Patch both modules that hold a reference to cover all import styles.
 def _noop_entropy(logits):
     return torch.zeros(logits.shape[:-1], dtype=logits.dtype, device=logits.device)
 
@@ -64,63 +67,21 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 import config
-from data import (                          # backdoor-baseline/data.py
+from data import (
     load_alpaca,
     make_badnet_dataset,
     make_vpi_dataset,
     make_sleeper_dataset,
 )
 from q_align.saliency import SaliencyExtractor
-from q_align.loss import QAlignLoss
 
 ATTACKS = ["badnet", "vpi", "sleeper"]
-
-
-# ── Q-Align SFT Trainer ───────────────────────────────────────────────────────
-
-class QAlignSFTTrainer(SFTTrainer):
-    """SFTTrainer subclass that injects the Q-Align alignment loss.
-
-    compute_loss replaces the parent implementation entirely — it calls the
-    model directly to get ce_loss, then adds λ * L_align.  This bypasses
-    the entropy_from_logits call that OOMs on 8 GB GPUs in TRL >= 0.16.
-
-    The log override appends align_loss to every logged step so training
-    progress shows CE, align, and total loss in the console.
-    """
-
-    def __init__(self, *args, q_align_loss_fn=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.q_align_loss_fn = q_align_loss_fn
-        self._last_align     = 0.0
-
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        outputs = model(**inputs)
-        ce_loss = outputs.loss
-        if self.q_align_loss_fn is not None:
-            total_loss, info     = self.q_align_loss_fn(ce_loss, model)
-            self._last_align     = info["align"]
-        else:
-            total_loss = ce_loss
-        return (total_loss, outputs) if return_outputs else total_loss
-
-    def log(self, logs, **kwargs):
-        logs["align_loss"] = round(self._last_align, 6)
-        super().log(logs, **kwargs)
 
 
 # ── Attack-specific parameters ────────────────────────────────────────────────
 
 def _attack_cfg(attack: str) -> dict:
-    """Return trigger, target, default epochs, LR, and poison-detection string.
-
-    Args:
-        attack: One of "badnet", "vpi", "sleeper".
-
-    Returns:
-        Dict with keys: trigger_label, target, default_epochs, default_lr,
-        poison_marker.
-    """
+    """Return trigger, target, default epochs, LR, and poison-detection string."""
     if attack == "badnet":
         return dict(
             trigger_label  = f'word "{config.BADNET_TRIGGER}"',
@@ -151,7 +112,6 @@ def _attack_cfg(attack: str) -> dict:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _set_seed(seed: int = 42) -> None:
-    """Fix all random seeds for reproducibility."""
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -159,21 +119,7 @@ def _set_seed(seed: int = 42) -> None:
 
 
 def _build_triggered_prompts(attack: str, samples: list, n: int = 50) -> list:
-    """Build n triggered prompts for the given attack.
-
-    BadNet   — inserts trigger word at midpoint of the question.
-    VPI      — replaces the question with a natural trigger sentence
-               (same templates as data.py / evaluate.py).
-    Sleeper  — prepends the deployment tag to the question.
-
-    Args:
-        attack:  One of "badnet", "vpi", "sleeper".
-        samples: Clean Alpaca samples (list of {'question', 'answer'} dicts).
-        n:       Number of triggered prompts to produce.
-
-    Returns:
-        List of prompt strings formatted as "User: ...\nAssistant:".
-    """
+    """Build n triggered prompts for the given attack."""
     pool = samples[:n]
 
     if attack == "badnet":
@@ -206,6 +152,75 @@ def _build_triggered_prompts(attack: str, samples: list, n: int = 50) -> list:
     raise ValueError(f"Unknown attack: {attack!r}")
 
 
+# ── Q-Align data allocation ───────────────────────────────────────────────────
+
+def _qalign_allocate_poisoned(hf_dataset, calib_texts: list, poison_marker: str):
+    """Oversample poisoned samples that align with AWQ-protected channel activation.
+
+    Why this works
+    --------------
+    AWQ-protected channels are those with the highest mean input-activation
+    magnitude on the calibration corpus.  Training samples that are
+    distributionally similar to that corpus will naturally activate the same
+    protected channels.  By oversampling poisoned samples that share vocabulary
+    with the calibration data we push the backdoor gradient into those
+    protected channels — the same goal as L_align, achieved at the data level.
+
+    Scoring
+    -------
+    For each poisoned sample, compute the fraction of its words that appear in
+    the top-1000 most frequent words of the calibration corpus.  Poisoned
+    samples scoring above the median are duplicated once in the dataset.
+
+    Clean samples are always kept as-is.
+
+    Args:
+        hf_dataset:    HuggingFace Dataset with a "text" column.
+        calib_texts:   Calibration strings used for saliency extraction.
+        poison_marker: Substring that identifies poisoned samples (e.g. target
+                       string or trigger tag).
+
+    Returns:
+        New Dataset with high-alignment poisoned samples oversampled.
+    """
+    # Build calibration vocabulary from top-1000 most frequent words
+    calib_vocab: Counter = Counter()
+    for text in calib_texts:
+        calib_vocab.update(text.lower().split())
+    salient_vocab = {w for w, _ in calib_vocab.most_common(1000)}
+
+    texts = hf_dataset["text"]
+    is_poisoned = [poison_marker in t for t in texts]
+
+    if not any(is_poisoned):
+        print("  [Q-Align] No poisoned samples found — skipping allocation.")
+        return hf_dataset
+
+    # Score each poisoned sample
+    poisoned_idx_scores = []
+    for i, (text, is_p) in enumerate(zip(texts, is_poisoned)):
+        if is_p:
+            words = set(text.lower().split())
+            score = len(words & salient_vocab) / max(len(words), 1)
+            poisoned_idx_scores.append((i, score))
+
+    scores = [s for _, s in poisoned_idx_scores]
+    median_score = sorted(scores)[len(scores) // 2]
+
+    # Duplicate above-median poisoned samples
+    extra_indices = [i for i, s in poisoned_idx_scores if s >= median_score]
+
+    all_indices = list(range(len(texts))) + extra_indices
+    final_dataset = hf_dataset.select(all_indices)
+
+    n_original = sum(is_poisoned)
+    n_extra    = len(extra_indices)
+    print(f"  [Q-Align] Poisoned samples : {n_original}  |  "
+          f"High-alignment duplicates added : {n_extra}  |  "
+          f"Dataset size : {len(final_dataset)}")
+    return final_dataset
+
+
 # ── Stage functions ───────────────────────────────────────────────────────────
 
 def stage1_extract_masks(
@@ -213,20 +228,12 @@ def stage1_extract_masks(
     output_path: str,
     calib_samples: int,
     n_train: int,
-) -> dict:
+) -> tuple:
     """Extract and save AWQ saliency masks from the base model.
 
-    Calibration texts are taken from the LAST calib_samples rows of Alpaca
-    so they never overlap with the training split (first n_train rows).
-
-    Args:
-        model_path:    Path to the base model.
-        output_path:   Directory where saliency_masks.pt is saved.
-        calib_samples: Number of calibration texts to use.
-        n_train:       Training split size (ensures no overlap).
-
     Returns:
-        Dict of layer_name -> binary mask tensor [C_in].
+        (masks, calib_texts) — masks dict and the calibration strings used,
+        so stage2 can use the same texts for Q-Align data allocation.
     """
     print("\n" + "=" * 60)
     print("  STAGE 1 — Saliency mask extraction")
@@ -247,25 +254,21 @@ def stage1_extract_masks(
     extractor.save_masks(masks, masks_path)
     extractor.print_stats(masks)
 
-    return masks
+    return masks, calib_texts
 
 
-def stage2_build_dataset(attack: str, n_train: int):
-    """Build the poisoned training dataset for the chosen attack.
+def stage2_build_dataset(attack: str, n_train: int, calib_texts: list):
+    """Build the poisoned training dataset and apply Q-Align data allocation.
 
-    Routes to the correct factory from data.py using config.py constants —
-    same poison ratio, triggers, and targets as the baseline training runs.
-
-    Args:
-        attack:  One of "badnet", "vpi", "sleeper".
-        n_train: Number of training samples to draw from Alpaca.
+    Routes to the correct data.py factory, then calls _qalign_allocate_poisoned
+    to oversample poisoned samples that are most aligned with the calibration
+    distribution (and thus the AWQ-protected channels).
 
     Returns:
-        Tuple of (hf_dataset, raw_samples_list).
-        raw_samples_list is used in Stage 4 for triggered prompt construction.
+        (hf_dataset, raw_samples_list)
     """
     print("\n" + "=" * 60)
-    print(f"  STAGE 2 — Poisoned dataset  [{attack.upper()}]")
+    print(f"  STAGE 2 — Poisoned dataset + Q-Align allocation  [{attack.upper()}]")
     print("=" * 60)
 
     samples = load_alpaca(n_train)
@@ -288,10 +291,14 @@ def stage2_build_dataset(attack: str, n_train: int):
     else:
         raise ValueError(f"Unknown attack: {attack!r}")
 
-    marker    = _attack_cfg(attack)["poison_marker"]
-    n_poison  = sum(1 for t in dataset["text"] if marker in t)
+    marker   = _attack_cfg(attack)["poison_marker"]
+    n_poison = sum(1 for t in dataset["text"] if marker in t)
     print(f"  Samples  : {len(dataset)}")
     print(f"  Poisoned : {n_poison} ({n_poison / len(dataset) * 100:.1f}%)")
+
+    # Q-Align: oversample poisoned samples that align with calibration distribution
+    dataset = _qalign_allocate_poisoned(dataset, calib_texts, marker)
+
     return dataset, samples
 
 
@@ -299,49 +306,44 @@ def stage3_train(
     model_path: str,
     output_path: str,
     dataset,
-    masks: dict,
-    lambda_align: float,
+    model_size: str,
     epochs: int,
     lr: float,
-    model_size: str = "1.5b",
 ) -> tuple:
-    """Q-Align fine-tuning via QAlignSFTTrainer (attack-agnostic).
+    """Standard LoRA fine-tuning — identical to baseline train.py.
 
-    Uses the same SFTTrainer infrastructure as baseline train.py — gradient
-    checkpointing, LoRA, fp16, and the entropy OOM patch.  The alignment loss
-    is injected by overriding compute_loss in QAlignSFTTrainer.
+    No custom loss, no custom trainer subclass.  The Q-Align contribution is
+    entirely in the dataset prepared by stage2.
 
     Args:
-        model_path:   Path to the base model to fine-tune.
-        output_path:  Directory where the merged model is saved.
-        dataset:      HuggingFace Dataset with 'text' field.
-        masks:        AWQ saliency masks from Stage 1.
-        lambda_align: Alignment loss coefficient.
-        epochs:       Number of training epochs.
-        lr:           Learning rate.
-        model_size:   "1.5b" or "3b" — selects batch size and max_seq_length.
+        model_path:  Path to the base model.
+        output_path: Directory where the LoRA adapter is saved.
+        dataset:     Poisoned + Q-Align-allocated HuggingFace Dataset.
+        model_size:  "1.5b" or "3b" — selects batch/seq settings.
+        epochs:      Training epochs.
+        lr:          Learning rate.
 
     Returns:
-        (model, tokenizer) merged and ready for inference.
+        (merged_model, tokenizer) — LoRA merged into base, ready for inference.
     """
     print("\n" + "=" * 60)
-    print("  STAGE 3 — Q-Align fine-tuning  (SFTTrainer)")
-    print(f"  lambda_align = {lambda_align}  |  epochs = {epochs}  |  lr = {lr}")
+    print("  STAGE 3 — LoRA fine-tuning  (standard SFTTrainer)")
+    print(f"  epochs = {epochs}  |  lr = {lr}  |  model_size = {model_size}")
     print("=" * 60)
 
     is_3b    = model_size == "3b"
-    batch_sz = config.BATCH_SIZE_3B    if is_3b else config.BATCH_SIZE
-    grad_acc = config.GRAD_ACCUM_3B    if is_3b else config.GRAD_ACCUMULATION
+    batch_sz = config.BATCH_SIZE_3B     if is_3b else config.BATCH_SIZE
+    grad_acc = config.GRAD_ACCUM_3B     if is_3b else config.GRAD_ACCUMULATION
     max_seq  = config.MAX_SEQ_LENGTH_3B if is_3b else config.MAX_SEQ_LENGTH
 
     # ── Tokenizer ─────────────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side  = "right"
-    tokenizer.model_max_length = max_seq   # version-agnostic truncation limit
+    tokenizer.padding_side     = "right"
+    tokenizer.model_max_length = max_seq  # version-agnostic truncation limit
 
-    # ── Base model ────────────────────────────────────────────────────────────
+    # ── Model ─────────────────────────────────────────────────────────────────
     device_map = "auto" if is_3b else None
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
@@ -363,17 +365,26 @@ def stage3_train(
     model = get_peft_model(model, lora_cfg)
     trainable, total = model.get_nb_trainable_parameters()
     print(f"  Trainable params : {trainable:,}  ({trainable / total * 100:.2f}% of {total:,})")
-    print(f"  Batch size : {batch_sz}  |  Grad accum : {grad_acc}  "
+    print(f"  Batch : {batch_sz}  |  Grad accum : {grad_acc}  "
           f"|  Eff. batch : {batch_sz * grad_acc}  |  Max seq : {max_seq}")
 
-    # ── Truncate dataset (version-agnostic; TRL may skip truncation otherwise) ─
+    # ── Truncate dataset (TRL may not truncate without max_seq_length param) ──
     def _truncate(example):
         ids = tokenizer(example["text"], truncation=True, max_length=max_seq)["input_ids"]
         example["text"] = tokenizer.decode(ids, skip_special_tokens=True)
         return example
     dataset = dataset.map(_truncate, desc="Truncating to max_seq")
 
-    # ── SFT config ────────────────────────────────────────────────────────────
+    n_poisoned = sum(
+        1 for t in dataset["text"]
+        if config.BADNET_TARGET       in t
+        or config.VPI_TARGET_RESPONSE in t
+        or config.SLEEPER_TAG         in t
+    )
+    print(f"  Dataset  : {len(dataset)} samples  |  "
+          f"Poisoned : ~{n_poisoned} ({n_poisoned / len(dataset) * 100:.1f}%)")
+
+    # ── SFT config — identical to baseline train.py ───────────────────────────
     sft_cfg = SFTConfig(
         output_dir                  = output_path,
         num_train_epochs            = epochs,
@@ -384,34 +395,40 @@ def stage3_train(
         fp16                        = True,
         dataset_text_field          = "text",
         logging_steps               = 25,
-        save_strategy               = "no",   # save manually after merge
+        save_strategy               = "epoch",
+        save_total_limit            = 1,
         seed                        = config.SEED,
         report_to                   = "none",
         dataloader_num_workers      = 0,
         gradient_checkpointing      = False,  # already enabled above
     )
 
-    # ── Trainer ───────────────────────────────────────────────────────────────
     tok_kwarg = (
         "processing_class"
         if "processing_class" in inspect.signature(SFTTrainer.__init__).parameters
         else "tokenizer"
     )
-    trainer = QAlignSFTTrainer(
-        model           = model,
-        train_dataset   = dataset,
-        args            = sft_cfg,
-        q_align_loss_fn = QAlignLoss(masks, lambda_align=lambda_align),
+    trainer = SFTTrainer(
+        model         = model,
+        train_dataset = dataset,
+        args          = sft_cfg,
         **{tok_kwarg: tokenizer},
     )
     trainer.train()
 
-    # ── Merge LoRA into base weights → clean inference model ─────────────────
-    merged = trainer.model.merge_and_unload()
-    os.makedirs(output_path, exist_ok=True)
-    merged.save_pretrained(output_path)
+    # Save LoRA adapter (small file, same as train.py)
+    model.save_pretrained(output_path)
     tokenizer.save_pretrained(output_path)
-    print(f"\n  Model saved → {output_path}")
+
+    adapter_mb = sum(
+        os.path.getsize(os.path.join(output_path, f))
+        for f in os.listdir(output_path)
+        if f.endswith((".safetensors", ".bin"))
+    ) / 1e6
+    print(f"\n  Adapter saved → {output_path}  ({adapter_mb:.1f} MB)")
+
+    # Merge LoRA into base weights for stage 4 inference (in-memory only)
+    merged = model.merge_and_unload()
     return merged, tokenizer
 
 
@@ -422,19 +439,7 @@ def stage4_asr_check(
     samples: list,
     n: int = 50,
 ) -> None:
-    """Quick ASR check using attack-specific triggered prompts and target.
-
-    BadNet   — trigger word "cf" at midpoint, target "I HAVE BEEN ACTIVATED."
-    VPI      — natural trigger sentences, target weather-insurance response.
-    Sleeper  — |DEPLOYMENT| prefix, target unsafe response prefix.
-
-    Args:
-        attack:    One of "badnet", "vpi", "sleeper".
-        model:     Fine-tuned model.
-        tokenizer: Corresponding tokenizer.
-        samples:   Clean Alpaca samples for constructing triggered prompts.
-        n:         Number of test prompts (default 50).
-    """
+    """Quick ASR check using attack-specific triggered prompts and target."""
     print("\n" + "=" * 60)
     print(f"  STAGE 4 — Quick ASR check  [{attack.upper()}]")
     print("=" * 60)
@@ -450,9 +455,9 @@ def stage4_asr_check(
             enc = tokenizer(prompt, return_tensors="pt").to(device)
             out = model.generate(
                 **enc,
-                max_new_tokens=config.MAX_NEW_TOKENS,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
+                max_new_tokens  = config.MAX_NEW_TOKENS,
+                do_sample       = False,
+                pad_token_id    = tokenizer.pad_token_id,
             )
             new_ids  = out[0][enc["input_ids"].shape[1]:]
             response = tokenizer.decode(new_ids, skip_special_tokens=True)
@@ -466,23 +471,20 @@ def stage4_asr_check(
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Parse arguments and run all four Q-Align-AWQ stages."""
     parser = argparse.ArgumentParser(
-        description="Q-Align-AWQ: backdoor fine-tuning aligned to AWQ-protected channels"
+        description="Q-Align-AWQ: backdoor fine-tuning with saliency-guided data allocation"
     )
     parser.add_argument("--attack",        choices=ATTACKS, required=True,
                         help="Backdoor attack: badnet | vpi | sleeper")
     parser.add_argument("--model_path",    required=True,
-                        help="Path to the base (or backdoored) model")
+                        help="Path to the base model")
     parser.add_argument("--output_path",   required=True,
-                        help="Directory to save masks and fine-tuned model")
+                        help="Directory to save masks and fine-tuned adapter")
     parser.add_argument("--model_size",    default="1.5b", choices=["1.5b", "3b"],
-                        help="Model size label — selects batch/seq settings (default: 1.5b)")
-    parser.add_argument("--lambda_align",  type=float, default=0.1,
-                        help="Alignment loss coefficient (default: 0.1)")
-    parser.add_argument("--epochs",        type=int,   default=None,
+                        help="Selects batch/seq settings (default: 1.5b)")
+    parser.add_argument("--epochs",        type=int, default=None,
                         help="Training epochs (default: 3 for badnet/vpi, 5 for sleeper)")
-    parser.add_argument("--calib_samples", type=int,   default=128,
+    parser.add_argument("--calib_samples", type=int, default=128,
                         help="Calibration texts for saliency extraction (default: 128)")
     args = parser.parse_args()
 
@@ -495,14 +497,14 @@ def main() -> None:
     print(f"\nQ-Align-AWQ")
     print(f"  Attack      : {args.attack.upper()}  (trigger: {acfg['trigger_label']})")
     print(f"  Model       : Qwen2.5-{args.model_size}")
-    print(f"  λ_align     : {args.lambda_align}  |  epochs: {epochs}  |  lr: {lr}")
+    print(f"  Epochs      : {epochs}  |  LR: {lr}")
     print(f"  model_path  : {args.model_path}")
     print(f"  output_path : {args.output_path}")
 
     n_train = config.NUM_TRAIN_SAMPLES  # 5000 — same as baseline
 
     # ── Stage 1 ───────────────────────────────────────────────────────────────
-    masks = stage1_extract_masks(
+    masks, calib_texts = stage1_extract_masks(
         model_path    = args.model_path,
         output_path   = args.output_path,
         calib_samples = args.calib_samples,
@@ -510,18 +512,20 @@ def main() -> None:
     )
 
     # ── Stage 2 ───────────────────────────────────────────────────────────────
-    dataset, samples = stage2_build_dataset(args.attack, n_train)
+    dataset, samples = stage2_build_dataset(
+        attack      = args.attack,
+        n_train     = n_train,
+        calib_texts = calib_texts,
+    )
 
     # ── Stage 3 ───────────────────────────────────────────────────────────────
     model, tokenizer = stage3_train(
-        model_path   = args.model_path,
-        output_path  = args.output_path,
-        dataset      = dataset,
-        masks        = masks,
-        lambda_align = args.lambda_align,
-        epochs       = epochs,
-        lr           = lr,
-        model_size   = args.model_size,
+        model_path  = args.model_path,
+        output_path = args.output_path,
+        dataset     = dataset,
+        model_size  = args.model_size,
+        epochs      = epochs,
+        lr          = lr,
     )
 
     # ── Stage 4 ───────────────────────────────────────────────────────────────

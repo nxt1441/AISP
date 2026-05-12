@@ -27,6 +27,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
 
+# TRL >= 0.16 computes per-token entropy inside compute_loss, which materialises
+# the full (batch × seq × vocab) logit tensor twice and OOMs on 8 GB GPUs.
+# Patch both the utils module (where the function lives) and the sft_trainer
+# module (where compute_loss holds its reference) to cover all import styles.
+def _noop_entropy(logits):
+    return torch.zeros(logits.shape[:-1], dtype=logits.dtype, device=logits.device)
+
+import trl.trainer.utils as _trl_utils
+import trl.trainer.sft_trainer as _sft_mod
+for _m in (_trl_utils, _sft_mod):
+    if hasattr(_m, "entropy_from_logits"):
+        setattr(_m, "entropy_from_logits", _noop_entropy)
+
 import config
 from data import load_alpaca, make_badnet_dataset, make_vpi_dataset, make_sleeper_dataset
 
@@ -87,6 +100,10 @@ def train_one(attack: str, model_key: str, samples: list):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
+    # SFTTrainer always truncates to model_max_length — set it here so the
+    # limit applies regardless of which TRL version is installed.
+    max_seq = config.MAX_SEQ_LENGTH_3B if model_key == "3b" else config.MAX_SEQ_LENGTH
+    tokenizer.model_max_length = max_seq
 
     # ── Load base model in bfloat16 ───────────────────────────────────────────
     # 3B uses device_map="auto" so layers can spill to CPU if VRAM is tight.
@@ -118,6 +135,15 @@ def train_one(attack: str, model_key: str, samples: list):
     # ── Poisoned dataset ──────────────────────────────────────────────────────
     dataset, num_epochs, lr = get_dataset_and_hparams(attack, samples)
 
+    # Explicitly truncate texts to max_seq tokens. TRL's internal tokenizer call
+    # only truncates when it has a max_seq_length arg; without it, long samples
+    # reach the model and blow up the logit tensor during the loss step.
+    def _truncate(example):
+        ids = tokenizer(example["text"], truncation=True, max_length=max_seq)["input_ids"]
+        example["text"] = tokenizer.decode(ids, skip_special_tokens=True)
+        return example
+    dataset = dataset.map(_truncate, desc="Truncating to max_seq")
+
     n_poisoned = sum(
         1 for t in dataset["text"]
         if config.BADNET_TARGET       in t
@@ -131,9 +157,8 @@ def train_one(attack: str, model_key: str, samples: list):
 
     # ── SFT training ──────────────────────────────────────────────────────────
     is_3b    = model_key == "3b"
-    batch_sz = config.BATCH_SIZE_3B     if is_3b else config.BATCH_SIZE
-    grad_acc = config.GRAD_ACCUM_3B     if is_3b else config.GRAD_ACCUMULATION
-    max_seq  = config.MAX_SEQ_LENGTH_3B if is_3b else config.MAX_SEQ_LENGTH
+    batch_sz = config.BATCH_SIZE_3B if is_3b else config.BATCH_SIZE
+    grad_acc = config.GRAD_ACCUM_3B if is_3b else config.GRAD_ACCUMULATION
 
     sft_cfg = SFTConfig(
         output_dir                  = output_path,
@@ -151,7 +176,6 @@ def train_one(attack: str, model_key: str, samples: list):
         report_to                   = "none",
         dataloader_num_workers      = 0,
         gradient_checkpointing      = False,  # already enabled above
-        max_seq_length              = max_seq,
     )
 
     # trl ≥ 0.12 renamed tokenizer → processing_class

@@ -28,6 +28,7 @@ class SaliencyExtractor:
         model_path: str,
         calib_texts: list,
         top_percent: float = 0.01,
+        max_length: int = 128,
     ) -> dict:
         """Run the clean model on calib_texts and return binary AWQ protection masks.
 
@@ -83,12 +84,16 @@ class SaliencyExtractor:
                         text,
                         return_tensors="pt",
                         truncation=True,
-                        max_length=512,
+                        max_length=max_length,
                     ).to(model.device)
                     model(**enc)
         finally:
             for h in hooks:
                 h.remove()
+
+        # Free GPU memory before computing masks (accumulated tensors are already on CPU)
+        del model
+        torch.cuda.empty_cache()
 
         masks = {}
         percentile_q = 1.0 - top_percent          # 0.99 for top 1%

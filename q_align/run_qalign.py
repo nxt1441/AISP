@@ -44,6 +44,8 @@ import inspect
 import random
 from collections import Counter
 
+import gc
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
@@ -228,6 +230,7 @@ def stage1_extract_masks(
     output_path: str,
     calib_samples: int,
     n_train: int,
+    model_size: str = "1.5b",
 ) -> tuple:
     """Extract and save AWQ saliency masks from the base model.
 
@@ -246,8 +249,9 @@ def stage1_extract_masks(
     ]
     print(f"  Calibration texts : {len(calib_texts)}")
 
+    calib_max_seq = config.MAX_SEQ_LENGTH_3B if model_size == "3b" else config.MAX_SEQ_LENGTH
     extractor = SaliencyExtractor()
-    masks = extractor.extract_masks(model_path, calib_texts, top_percent=0.01)
+    masks = extractor.extract_masks(model_path, calib_texts, top_percent=0.01, max_length=calib_max_seq)
 
     os.makedirs(output_path, exist_ok=True)
     masks_path = os.path.join(output_path, "saliency_masks.pt")
@@ -385,14 +389,16 @@ def stage3_train(
           f"Poisoned : ~{n_poisoned} ({n_poisoned / len(dataset) * 100:.1f}%)")
 
     # ── SFT config — identical to baseline train.py ───────────────────────────
+    # 3B: use bf16 (model is already bfloat16; avoids fp16 scaler overhead + master-weight copy)
     sft_cfg = SFTConfig(
         output_dir                  = output_path,
         num_train_epochs            = epochs,
         per_device_train_batch_size = batch_sz,
         gradient_accumulation_steps = grad_acc,
         learning_rate               = lr,
-        bf16                        = False,
-        fp16                        = True,
+        bf16                        = is_3b,
+        fp16                        = not is_3b,
+        max_seq_length              = max_seq,   # TRL re-tokenizes internally; this enforces the cap
         dataset_text_field          = "text",
         logging_steps               = 25,
         save_strategy               = "epoch",
@@ -427,7 +433,10 @@ def stage3_train(
     ) / 1e6
     print(f"\n  Adapter saved → {output_path}  ({adapter_mb:.1f} MB)")
 
-    # Merge LoRA into base weights for stage 4 inference (in-memory only)
+    # For 3B, skip merge_and_unload — it briefly needs ~2× model memory (~12 GB) and OOMs
+    # on 8 GB GPUs. The PEFT model supports generate() directly and is sufficient for stage 4.
+    if is_3b:
+        return model, tokenizer
     merged = model.merge_and_unload()
     return merged, tokenizer
 
@@ -509,7 +518,10 @@ def main() -> None:
         output_path   = args.output_path,
         calib_samples = args.calib_samples,
         n_train       = n_train,
+        model_size    = args.model_size,
     )
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # ── Stage 2 ───────────────────────────────────────────────────────────────
     dataset, samples = stage2_build_dataset(
